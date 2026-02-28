@@ -1,0 +1,439 @@
+---
+x-airflow-common:
+  &airflow-common
+  build:
+      context: .
+      dockerfile: docker/airflow.Dockerfile
+  image: apache/airflow:2.8.1
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@airflow-redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-1234}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:-change-me}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__CORE__TEST_CONNECTION: 'Enabled'
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    - spark_ivy_cache:/home/airflow/.ivy2
+    - ./spark/conf:/opt/spark/conf
+    - ./spark/jobs:/opt/spark/jobs
+    - ./airflow/dags:/opt/airflow/dags  
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  env_file:
+    - .env
+  networks:
+      - data-network 
+  depends_on:
+    &airflow-common-depends-on
+    airflow-redis:
+      condition: service_healthy
+    airflow-postgres:
+      condition: service_healthy
+services:
+  airflow-postgres:
+    image: postgres:13
+    container_name: airflow_postgres
+    environment:
+        POSTGRES_USER: ${AIRFLOW_PG_USER:-airflow}
+        POSTGRES_PASSWORD: ${AIRFLOW_PG_PASS:-airflow}
+        POSTGRES_DB: ${AIRFLOW_PG_DB:-airflow}
+    networks:
+      - data-network 
+    volumes:
+      - airflow_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-redis:
+    container_name: airflow_redis
+    image: redis:7.2-bookworm
+    networks:
+      - data-network 
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    container_name: airflow-webserver
+    ports:
+      - "8080:8080"
+    networks:
+      - data-network 
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    container_name: airflow-scheduler
+    networks:
+      - data-network 
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    user: "0:0" 
+    command: celery worker
+    container_name: airflow-worker
+    networks:
+      - data-network 
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 60s
+      timeout: 30s
+      retries: 10
+      start_period: 60s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    container_name: airflow-triggerer
+    networks:
+      - data-network 
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    container_name: airflow-init
+    networks:
+      - data-network 
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/config /opt/airflow/plugins /opt/airflow/dags
+        chmod -R 777 /opt/airflow/logs
+        if [[ -z "${AIRFLOW_UID}:" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set "
+          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+          echo "For other operating systems you can get rid of the warning with manually created .env file:"
+          echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
+          echo
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+        warning_resources="false"
+        if (( mem_available < 4000 )) ; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+          echo "At least 4GB of memory required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
+          echo
+          warning_resources="true"
+        fi
+        if (( cpus_available < 2 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+          echo "At least 2 CPUs recommended. You have $${cpus_available}"
+          echo
+          warning_resources="true"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+          echo "At least 10 GBs recommended. You have $$(numfmt --to iec $$((disk_available * 1024 )))"
+          echo
+          warning_resources="true"
+        fi
+        if [[ $${warning_resources} == "true" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow (see above)!\e[0m"
+          echo "Please follow the instructions to increase amount of resources available:"
+          echo "   https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#before-you-begin"
+          echo
+        fi
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+
+  metabase-postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    volumes:
+      - metabase_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${METABASE_POSTGRES_USER:-metabaseuser}
+      POSTGRES_PASSWORD: ${METABASE_POSTGRES_PASSWORD:-metabasepassword}
+      POSTGRES_DB: ${METABASE_POSTGRES_DB:-metabase}
+    networks:
+      - data-network 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+  metabase-setup:
+    image: curlimages/curl:latest
+    container_name: metabase-setup
+    entrypoint: ["sh", "/setup.sh"]
+    depends_on:
+      metabase:
+        condition: service_healthy
+    volumes:
+      - ./metabase/setup.sh:/setup.sh
+    networks:
+      - data-network
+    restart: "no"
+  metabase:
+    image: metabase/metabase:v0.58.5.x
+    container_name: metabase
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: ${MB_DB_TYPE:-postgres}
+      MB_DB_DBNAME: ${MB_DB_DBNAME:-metabase}
+      MB_DB_PORT: ${MB_DB_PORT:-5432}
+      MB_DB_USER: ${MB_DB_USER:-metabaseuser}
+      MB_DB_PASS: ${MB_DB_PASS:-metabasepassword}
+      MB_DB_HOST: ${MB_DB_HOST:-metabase-postgres}
+    volumes:
+      - metabase_app_data:/var/lib/metabase
+    networks:
+      - data-network 
+    depends_on:
+      metabase-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - data-network
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-admin} ${MINIO_ROOT_PASSWORD:-admin123}; do
+        echo 'Waiting for MinIO...'; sleep 2;
+      done;
+      mc mb -p local/raw || true;
+      mc mb -p local/core || true;
+      mc ls local;
+      "
+    networks:
+      - data-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9009:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-admin}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+    networks:
+      - data-network
+    healthcheck: 
+      test: ["CMD", "wget", "--spider", "-q", "localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  adminer:
+    image: adminer
+    ports:
+      - "8085:8080"
+    networks:
+      - data-network  
+
+  postgres:
+    image: postgres:13
+    container_name: postgres_s
+    environment:
+        POSTGRES_USER: admin
+        POSTGRES_PASSWORD: admin
+        POSTGRES_DB: default
+    networks:
+      - data-network 
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+   
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/spark-master.Dockerfile
+    image: custom-airflow:3.5.1
+    container_name: spark-master
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+    environment:
+        SPARK_MASTER_HOST: spark-master  
+        SPARK_MASTER_PORT: 7077
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    working_dir: /opt/spark/jobs
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/jobs:/opt/spark/jobs
+      - spark_ivy_cache:/home/spark/.ivy2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    env_file:
+      - .env
+    networks:
+      - data-network
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/jobs:/opt/spark/jobs
+      - spark_ivy_cache:/home/spark/.ivy2
+    environment:
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2G}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_MASTER: spark://spark-master:7077
+    depends_on:
+      - spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - data-network
+  dbt:
+    build:
+      context: .
+      dockerfile: docker/dbt.Dockerfile
+    container_name: dbt
+    depends_on:
+      clickhouse:
+        condition: service_healthy 
+    volumes:
+      - ./dbt/crypto_analytics:/usr/app/crypto_analytics
+      - ./dbt/.dbt:/home/dbt/.dbt
+    working_dir: /usr/app/crypto_analytics
+    env_file:
+      - .env
+    networks:
+      - data-network
+    entrypoint: ["tail", "-f", "/dev/null"]
+ 
+volumes:
+  postgres_data:
+  minio_data:
+  clickhouse_data:
+  airflow_postgres:
+  spark_ivy_cache:
+  metabase_db_data:
+  metabase_app_data:
+networks:
+  data-network:
+    driver: bridge
