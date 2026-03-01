@@ -321,7 +321,7 @@ services:
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-admin}
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-kmk}
     networks:
       - data-network
     healthcheck: 
@@ -333,25 +333,37 @@ services:
 
   adminer:
     image: adminer
+    container_name: adminer_s
     ports:
       - "8085:8080"
     networks:
       - data-network  
 
+  generator:
+    profiles: ["manual"]
+    build:
+      context: .
+      dockerfile: docker/generator.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-network
+    restart: "no"
+
   postgres:
     image: postgres:13
     container_name: postgres_s
     environment:
-        POSTGRES_USER: admin
-        POSTGRES_PASSWORD: admin
-        POSTGRES_DB: default
+        POSTGRES_USER: ${SOURCES_POSTGRES_USER:-admin}
+        POSTGRES_PASSWORD: ${SOURCES_POSTGRES_PASSWORD:-admin}
+        POSTGRES_DB: ${SOURCES_POSTGRES_DB:-kmk}
     networks:
       - data-network 
     volumes:
       - postgres_data:/var/lib/postgresql/data
-   
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d kmk"]
       interval: 10s
       retries: 5
       start_period: 5s
@@ -417,9 +429,9 @@ services:
       clickhouse:
         condition: service_healthy 
     volumes:
-      - ./dbt/crypto_analytics:/usr/app/crypto_analytics
+      - ./dbt/kmk_analytics:/usr/app/kmk_analytics
       - ./dbt/.dbt:/home/dbt/.dbt
-    working_dir: /usr/app/crypto_analytics
+    working_dir: /usr/app/kmk_analytics
     env_file:
       - .env
     networks:
